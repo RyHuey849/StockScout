@@ -1,0 +1,7 @@
+discord.py>=2.6
+requests>=2.32
+beautifulsoup4>=4.12
+APScheduler>=3.10
+python-dotenv>=1.0
+# Needed for products with "checker": "js" (run `playwright install chromium` after installing)
+playwright>=1.60
