@@ -32,16 +32,26 @@ run on a schedule (every few hours), not continuously.
 5. **Hosting** — designed to run as a small always-on process (VPS, home
    server, Raspberry Pi). Needs a persistent Discord connection, so not
    suited to serverless/one-shot execution.
+6. **Web dashboard** (optional) — `dashboard_api.py` (FastAPI) + a React
+   app in `dashboard/`, run as a second process sharing the same SQLite
+   DB. View/add/remove tracked products and trigger a check from the
+   browser. In-stock transitions found by dashboard-triggered checks are
+   written to a `pending_alerts` outbox table that the bot drains every
+   minute, so Discord pings still go out. No login — it binds to
+   127.0.0.1 by default; don't expose it beyond localhost/VPN as-is.
 
 ## Commands (usable by anyone in the server)
 
+Slash commands, registered with Discord's application-command system (so
+they autocomplete in the client):
+
 | Command | Description |
 |---|---|
-| `!addproduct <url>` | Start tracking a product |
-| `!removeproduct <url>` | Stop tracking a product (only the person who added it, or a server admin, can remove it) |
-| `!myproducts` | List products you're tracking |
-| `!list` | List everything everyone is tracking |
-| `!checknow` | Manually trigger a check of all products right now |
+| `/addproduct <url>` | Start tracking a product |
+| `/removeproduct <url>` | Stop tracking a product (only the person who added it, or a server admin, can remove it) |
+| `/myproducts` | List products you're tracking (shown only to you) |
+| `/list` | List everything everyone is tracking |
+| `/checknow` | Manually trigger a check of all products right now |
 
 ## Guardrails for shared/multi-user use
 
@@ -64,6 +74,13 @@ run on a schedule (every few hours), not continuously.
 - `stock_bot_v2.py` — main bot: config, DB helpers (products table),
   two-layer stock-check logic, Discord event handlers and self-service
   commands, scheduler setup.
+- `dashboard_api.py` — FastAPI backend for the web dashboard; reuses the
+  bot module's DB/scraping helpers and serves the built React app from
+  `dashboard/dist`. Run with `python dashboard_api.py` →
+  http://127.0.0.1:8000.
+- `dashboard/` — React (Vite) frontend. `npm install` then
+  `npm run build` to produce `dashboard/dist`; `npm run dev` for a dev
+  server with hot reload (proxies `/api` to the FastAPI server).
 - `requirements.txt` — Python dependencies (includes `python-dotenv`).
 - `.env.example` — template for `DISCORD_BOT_TOKEN` and
   `DISCORD_CHANNEL_ID`; copy to `.env` and fill in real values (never
@@ -76,9 +93,9 @@ run on a schedule (every few hours), not continuously.
 1. Create a Discord bot application at
    https://discord.com/developers/applications → add a Bot → copy the
    token.
-2. Invite the bot to your server with "Send Messages" permission. Enable
-   the "Message Content Intent" in the Bot settings (required for reading
-   command text).
+2. Invite the bot to your server with the `bot` and `applications.commands`
+   scopes and "Send Messages" permission. (No Message Content Intent needed —
+   slash commands don't read message text.)
 3. Get your target channel's ID (enable Developer Mode in Discord →
    right-click channel → Copy ID).
 4. Create a virtual environment and install dependencies:
@@ -88,9 +105,13 @@ run on a schedule (every few hours), not continuously.
    pip install -r requirements.txt
    ```
 5. Copy `.env.example` to `.env` and fill in your real
-   `DISCORD_BOT_TOKEN` and `DISCORD_CHANNEL_ID`.
+   `DISCORD_BOT_TOKEN` and `DISCORD_CHANNEL_ID`. Optionally set
+   `DISCORD_GUILD_ID` (your server's ID) — slash commands then appear
+   instantly; without it, a global sync can take up to an hour to show up.
 6. Run it: `python stock_bot_v2.py`
-7. In Discord, try `!addproduct <url>` with a real product link to test.
+7. In Discord, try `/addproduct` with a real product link to test.
+8. (Optional) Web dashboard: `cd dashboard && npm install && npm run build`,
+   then `python dashboard_api.py` and open http://127.0.0.1:8000.
 
 ## Known Gaps / Next Steps
 
@@ -115,11 +136,16 @@ run on a schedule (every few hours), not continuously.
 
 ## Possible Future Enhancements
 
-- Slash commands (`/addproduct`) instead of prefix commands, for a more
-  modern Discord UX.
+- ~~Slash commands (`/addproduct`) instead of prefix commands, for a more
+  modern Discord UX.~~ Done — all commands are now slash commands.
 - Price-drop tracking in addition to stock status.
-- Richer `!list` / `!myproducts` output (embeds with thumbnails, last
-  checked time, price).
+- ~~Richer `/list` / `/myproducts` output (embeds with thumbnails, last
+  checked time, price).~~ Done — listings are embeds showing thumbnail
+  (og:image), price (scraped once when the product is added), a
+  status-colored stripe, relative last-checked time, and (in `/list`)
+  who added it.
 - Configurable per-product check interval (some items matter more than
   others).
-- Web dashboard for managing tracked products outside of Discord.
+- ~~Web dashboard for managing tracked products outside of Discord.~~
+  Done — see `dashboard_api.py` + `dashboard/`. Future: add auth if it
+  ever needs to be reachable beyond localhost.

@@ -156,6 +156,20 @@ def init_db() -> None:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_products_url_key "
             "ON products(url_key)"
         )
+        # Outbox for in-stock alerts raised outside the bot process (e.g. a
+        # check triggered from the web dashboard); the bot drains it on a
+        # short interval so Discord pings still go out.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url TEXT NOT NULL,
+                name TEXT NOT NULL,
+                added_by_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
 
 
 def get_product(url: str) -> sqlite3.Row | None:
@@ -217,6 +231,28 @@ def products_for_user(user_id: int) -> list[sqlite3.Row]:
 def all_products() -> list[sqlite3.Row]:
     with _connect() as conn:
         return conn.execute("SELECT * FROM products ORDER BY added_at").fetchall()
+
+
+def queue_alert(product: sqlite3.Row) -> None:
+    """Queue an in-stock alert for the bot to deliver (used by processes
+    other than the bot, e.g. the dashboard API)."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO pending_alerts (url, name, added_by_id, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (product["url"], product["name"], product["added_by_id"], now),
+        )
+
+
+def drain_pending_alerts() -> list[sqlite3.Row]:
+    with _connect() as conn:
+        rows = conn.execute("SELECT * FROM pending_alerts ORDER BY id").fetchall()
+        if rows:
+            conn.execute(
+                "DELETE FROM pending_alerts WHERE id <= ?", (rows[-1]["id"],)
+            )
+        return rows
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +516,18 @@ async def setup_hook() -> None:
         log.info("Slash commands synced globally (may take up to an hour to appear)")
 
 
+async def deliver_queued_alerts() -> None:
+    """Send alerts queued by other processes (e.g. the dashboard API)."""
+    rows = await asyncio.to_thread(drain_pending_alerts)
+    if not rows:
+        return
+    channel = bot.get_channel(CHANNEL_ID)
+    if channel is None:
+        log.error("Channel %s not found — check DISCORD_CHANNEL_ID", CHANNEL_ID)
+        return
+    await announce([_alert_line(row) for row in rows], channel)
+
+
 @bot.event
 async def on_ready() -> None:
     log.info("Logged in as %s", bot.user)
@@ -490,6 +538,7 @@ async def on_ready() -> None:
             hours=CHECK_INTERVAL_HOURS,
             next_run_time=datetime.now(timezone.utc),  # run once at startup
         )
+        scheduler.add_job(deliver_queued_alerts, "interval", seconds=60)
         scheduler.start()
         log.info("Scheduler started: checking every %s hours", CHECK_INTERVAL_HOURS)
 

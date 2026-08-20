@@ -5,3 +5,6 @@ APScheduler>=3.10
 python-dotenv>=1.0
 # Needed for products with "checker": "js" (run `playwright install chromium` after installing)
 playwright>=1.60
+# Web dashboard API (dashboard_api.py)
+fastapi>=0.115
+uvicorn>=0.30
