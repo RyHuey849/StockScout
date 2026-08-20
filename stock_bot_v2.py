@@ -1,11 +1,12 @@
 """Discord stock-alert bot, v2 — multi-user.
 
-Anyone in the server can track products via commands (!addproduct <url>);
+Anyone in the server can track products via slash commands (/addproduct);
 the bot checks them on a schedule and pings the person who added an item
 when it comes back in stock. See PLAN.md for the full design.
 """
 
 import asyncio
+import json
 import logging
 import os
 import random
@@ -13,12 +14,13 @@ import re
 import sqlite3
 import time
 from datetime import datetime, timezone
-from urllib.parse import parse_qsl, urlencode, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
 
 import discord
 import requests
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bs4 import BeautifulSoup
+from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
@@ -30,6 +32,9 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
+# Optional: syncing slash commands to one guild is instant; global sync can
+# take up to an hour to propagate.
+GUILD_ID = int(os.getenv("DISCORD_GUILD_ID", "0"))
 CHECK_INTERVAL_HOURS = float(os.getenv("CHECK_INTERVAL_HOURS", "3"))
 MAX_PRODUCTS_PER_USER = int(os.getenv("MAX_PRODUCTS_PER_USER", "10"))
 
@@ -127,14 +132,19 @@ def init_db() -> None:
                 added_by_name TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'unknown',
                 last_checked TEXT,
-                added_at TEXT NOT NULL
+                added_at TEXT NOT NULL,
+                image_url TEXT,
+                price TEXT
             )
             """
         )
-        # Migrate v2 tables created before url_key existed, and backfill.
+        # Migrate v2 tables created before newer columns existed, and backfill.
         columns = {r["name"] for r in conn.execute("PRAGMA table_info(products)")}
         if "url_key" not in columns:
             conn.execute("ALTER TABLE products ADD COLUMN url_key TEXT")
+        for column in ("image_url", "price"):
+            if column not in columns:
+                conn.execute(f"ALTER TABLE products ADD COLUMN {column} TEXT")
         for row in conn.execute(
             "SELECT url FROM products WHERE url_key IS NULL"
         ).fetchall():
@@ -157,7 +167,14 @@ def get_product(url: str) -> sqlite3.Row | None:
         ).fetchone()
 
 
-def add_product(url: str, name: str, user_id: int, user_name: str) -> None:
+def add_product(
+    url: str,
+    name: str,
+    user_id: int,
+    user_name: str,
+    image_url: str | None = None,
+    price: str | None = None,
+) -> None:
     """Insert a product. Raises sqlite3.IntegrityError if any variant of
     this URL is already tracked."""
     now = datetime.now(timezone.utc).isoformat()
@@ -165,10 +182,11 @@ def add_product(url: str, name: str, user_id: int, user_name: str) -> None:
         conn.execute(
             """
             INSERT INTO products
-                (url, url_key, name, added_by_id, added_by_name, added_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (url, url_key, name, added_by_id, added_by_name, added_at,
+                 image_url, price)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (url, make_url_key(url), name, user_id, user_name, now),
+            (url, make_url_key(url), name, user_id, user_name, now, image_url, price),
         )
 
 
@@ -310,17 +328,78 @@ def check_url(url: str) -> bool | None:
     return check_generic(url)
 
 
-def fetch_page_title(url: str) -> str | None:
-    """Best-effort product name from the page <title>."""
+def _json_ld_price(node) -> tuple[str, str | None] | None:
+    """Recursively find a schema.org offer price in parsed JSON-LD."""
+    if isinstance(node, dict):
+        price = node.get("price") or node.get("lowPrice")
+        if price not in (None, ""):
+            return str(price), node.get("priceCurrency")
+        for value in node.values():
+            found = _json_ld_price(value)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = _json_ld_price(item)
+            if found:
+                return found
+    return None
+
+
+def _format_price(amount: str, currency: str | None) -> str:
+    amount = str(amount).strip()
+    if currency in (None, "", "USD"):
+        return amount if amount.startswith("$") else f"${amount}"
+    return f"{amount} {currency}"
+
+
+def fetch_page_metadata(url: str) -> dict:
+    """Best-effort product name, thumbnail, and price from page markup.
+    Any of the values may be None — pages vary wildly."""
+    meta = {"name": None, "image_url": None, "price": None}
     html = _fetch_html(url)
     if html is None:
-        return None
+        return meta
     soup = BeautifulSoup(html, "html.parser")
-    if soup.title and soup.title.string:
-        title = " ".join(soup.title.string.split())
-        # Trim common "| Store" / ": Store" suffixes conservatively.
-        return title[:150] or None
-    return None
+
+    og_title = soup.find("meta", property="og:title")
+    if og_title and og_title.get("content"):
+        meta["name"] = " ".join(og_title["content"].split())[:150] or None
+    elif soup.title and soup.title.string:
+        meta["name"] = " ".join(soup.title.string.split())[:150] or None
+
+    og_image = soup.find("meta", property="og:image") or soup.find(
+        "meta", attrs={"name": "twitter:image"}
+    )
+    if og_image and og_image.get("content"):
+        meta["image_url"] = urljoin(url, og_image["content"].strip())
+
+    # Price: og/product meta tags, then JSON-LD offers, then itemprop.
+    amount = currency = None
+    for prop in ("product:price:amount", "og:price:amount"):
+        tag = soup.find("meta", property=prop)
+        if tag and tag.get("content"):
+            amount = tag["content"]
+            cur_tag = soup.find("meta", property=prop.rsplit(":", 1)[0] + ":currency")
+            currency = cur_tag.get("content") if cur_tag else None
+            break
+    if amount is None:
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string or "")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            found = _json_ld_price(data)
+            if found:
+                amount, currency = found
+                break
+    if amount is None:
+        tag = soup.find(attrs={"itemprop": "price"})
+        if tag:
+            amount = tag.get("content") or tag.get_text(strip=True)
+    if amount and str(amount).strip():
+        meta["price"] = _format_price(amount, currency)
+    return meta
 
 
 def check_all_products_sync() -> list[tuple[sqlite3.Row, str]]:
@@ -349,8 +428,8 @@ def check_all_products_sync() -> list[tuple[sqlite3.Row, str]]:
 # Discord bot
 # ---------------------------------------------------------------------------
 
+# Slash commands don't need the privileged Message Content intent.
 intents = discord.Intents.default()
-intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 scheduler = AsyncIOScheduler()
 
@@ -361,8 +440,8 @@ def _clean_url(url: str) -> str:
     return url
 
 
-def _is_admin(ctx: commands.Context) -> bool:
-    perms = getattr(ctx.author, "guild_permissions", None)
+def _is_admin(user: discord.User | discord.Member) -> bool:
+    perms = getattr(user, "guild_permissions", None)
     return bool(perms and (perms.administrator or perms.manage_guild))
 
 
@@ -390,6 +469,18 @@ async def run_checks_and_alert() -> None:
 
 
 @bot.event
+async def setup_hook() -> None:
+    if GUILD_ID:
+        guild = discord.Object(id=GUILD_ID)
+        bot.tree.copy_global_to(guild=guild)
+        await bot.tree.sync(guild=guild)
+        log.info("Slash commands synced to guild %s", GUILD_ID)
+    else:
+        await bot.tree.sync()
+        log.info("Slash commands synced globally (may take up to an hour to appear)")
+
+
+@bot.event
 async def on_ready() -> None:
     log.info("Logged in as %s", bot.user)
     if not scheduler.running:
@@ -403,44 +494,58 @@ async def on_ready() -> None:
         log.info("Scheduler started: checking every %s hours", CHECK_INTERVAL_HOURS)
 
 
-@bot.command()
-async def addproduct(ctx: commands.Context, url: str) -> None:
-    """Start tracking a product: !addproduct <url>"""
+@bot.tree.command(description="Start tracking a product")
+@app_commands.describe(url="Link to the product page")
+async def addproduct(interaction: discord.Interaction, url: str) -> None:
     url = _clean_url(url)
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        await ctx.send("That doesn't look like a valid product URL.")
+        await interaction.response.send_message(
+            "That doesn't look like a valid product URL.", ephemeral=True
+        )
         return
 
     existing = get_product(url)
     if existing:
-        if existing["added_by_id"] == ctx.author.id:
-            await ctx.send("You're already tracking that product.")
+        if existing["added_by_id"] == interaction.user.id:
+            await interaction.response.send_message(
+                "You're already tracking that product.", ephemeral=True
+            )
         else:
-            await ctx.send(
-                f"That product is already tracked by **{existing['added_by_name']}**."
+            await interaction.response.send_message(
+                f"That product is already tracked by **{existing['added_by_name']}**.",
+                ephemeral=True,
             )
         return
 
-    if len(products_for_user(ctx.author.id)) >= MAX_PRODUCTS_PER_USER:
-        await ctx.send(
+    if len(products_for_user(interaction.user.id)) >= MAX_PRODUCTS_PER_USER:
+        await interaction.response.send_message(
             f"You're already tracking {MAX_PRODUCTS_PER_USER} products (the limit). "
-            "Remove one with `!removeproduct <url>` first."
+            "Remove one with `/removeproduct` first.",
+            ephemeral=True,
         )
         return
 
-    await ctx.send("Adding — checking the page now…")
-    name = await asyncio.to_thread(fetch_page_title, url)
-    name = name or (parsed.hostname + parsed.path)[:100]
+    # Fetching the page takes longer than the 3s interaction deadline.
+    await interaction.response.defer()
+    meta = await asyncio.to_thread(fetch_page_metadata, url)
+    name = meta["name"] or (parsed.hostname + parsed.path)[:100]
     try:
-        add_product(url, name, ctx.author.id, ctx.author.display_name)
+        add_product(
+            url,
+            name,
+            interaction.user.id,
+            interaction.user.display_name,
+            meta["image_url"],
+            meta["price"],
+        )
     except sqlite3.IntegrityError:
-        await ctx.send("That product is already being tracked.")
+        await interaction.followup.send("That product is already being tracked.")
         return
 
     result = await asyncio.to_thread(check_url, url)
     if result is None:
-        await ctx.send(
+        await interaction.followup.send(
             f"Now tracking **{name}** — but I couldn't determine its stock status "
             "yet. I'll keep trying on the schedule."
         )
@@ -448,85 +553,121 @@ async def addproduct(ctx: commands.Context, url: str) -> None:
     status = "in_stock" if result else "out_of_stock"
     update_status(url, status)
     label = "in stock 🟢" if result else "out of stock 🔴"
-    await ctx.send(
-        f"Now tracking **{name}** for {ctx.author.mention} — currently {label}. "
+    await interaction.followup.send(
+        f"Now tracking **{name}** for {interaction.user.mention} — currently {label}. "
         "You'll get a ping here when it comes back."
         if not result
-        else f"Now tracking **{name}** for {ctx.author.mention} — it's {label} right now!"
+        else f"Now tracking **{name}** for {interaction.user.mention} — it's {label} right now!"
     )
 
 
-@bot.command()
-async def removeproduct(ctx: commands.Context, url: str) -> None:
-    """Stop tracking a product: !removeproduct <url>"""
+@bot.tree.command(description="Stop tracking a product")
+@app_commands.describe(url="Link to the product page you want to stop tracking")
+async def removeproduct(interaction: discord.Interaction, url: str) -> None:
     url = _clean_url(url)
     product = get_product(url)
     if product is None:
-        await ctx.send("That URL isn't being tracked.")
+        await interaction.response.send_message(
+            "That URL isn't being tracked.", ephemeral=True
+        )
         return
-    if product["added_by_id"] != ctx.author.id and not _is_admin(ctx):
-        await ctx.send(
+    if product["added_by_id"] != interaction.user.id and not _is_admin(interaction.user):
+        await interaction.response.send_message(
             f"Only **{product['added_by_name']}** (who added it) or a server "
-            "admin can remove that product."
+            "admin can remove that product.",
+            ephemeral=True,
         )
         return
     remove_product(url)
-    await ctx.send(f"Stopped tracking **{product['name']}**.")
+    await interaction.response.send_message(
+        f"Stopped tracking **{product['name']}**."
+    )
 
 
-def _product_lines(rows: list[sqlite3.Row], show_owner: bool) -> list[str]:
-    lines = []
-    for row in rows:
-        icon = {"in_stock": "🟢", "out_of_stock": "🔴"}.get(row["status"], "⚪")
-        owner = f" (added by {row['added_by_name']})" if show_owner else ""
-        lines.append(f"{icon} **{row['name']}**{owner}\n<{row['url']}>")
-    return lines
+STATUS_COLORS = {
+    "in_stock": discord.Color.green(),
+    "out_of_stock": discord.Color.red(),
+}
+STATUS_LABELS = {
+    "in_stock": "🟢 In stock",
+    "out_of_stock": "🔴 Out of stock",
+}
 
 
-async def _send_chunked(ctx: commands.Context, lines: list[str]) -> None:
-    chunk = ""
-    for line in lines:
-        if len(chunk) + len(line) + 1 > 1900:
-            await ctx.send(chunk)
-            chunk = ""
-        chunk += line + "\n"
-    if chunk:
-        await ctx.send(chunk)
+def _product_embed(row: sqlite3.Row, show_owner: bool) -> discord.Embed:
+    embed = discord.Embed(
+        title=row["name"][:256],
+        url=row["url"],
+        color=STATUS_COLORS.get(row["status"], discord.Color.light_grey()),
+    )
+    if row["image_url"]:
+        embed.set_thumbnail(url=row["image_url"])
+    embed.add_field(name="Status", value=STATUS_LABELS.get(row["status"], "⚪ Unknown"))
+    if row["price"]:
+        embed.add_field(name="Price (when added)", value=row["price"])
+    if row["last_checked"]:
+        checked = datetime.fromisoformat(row["last_checked"])
+        embed.add_field(name="Last checked", value=f"<t:{int(checked.timestamp())}:R>")
+    if show_owner:
+        embed.set_footer(text=f"Added by {row['added_by_name']}")
+    return embed
 
 
-@bot.command()
-async def myproducts(ctx: commands.Context) -> None:
-    """List the products you're tracking."""
-    rows = products_for_user(ctx.author.id)
+async def _send_embeds(
+    interaction: discord.Interaction,
+    embeds: list[discord.Embed],
+    ephemeral: bool = False,
+) -> None:
+    """Send embeds in batches of 10 (Discord's per-message limit): the
+    first batch as the interaction response, the rest as follow-ups."""
+    for i in range(0, len(embeds), 10):
+        batch = embeds[i : i + 10]
+        if interaction.response.is_done():
+            await interaction.followup.send(embeds=batch, ephemeral=ephemeral)
+        else:
+            await interaction.response.send_message(embeds=batch, ephemeral=ephemeral)
+
+
+@bot.tree.command(description="List the products you're tracking")
+async def myproducts(interaction: discord.Interaction) -> None:
+    rows = products_for_user(interaction.user.id)
     if not rows:
-        await ctx.send("You aren't tracking any products. Try `!addproduct <url>`.")
+        await interaction.response.send_message(
+            "You aren't tracking any products. Try `/addproduct`.", ephemeral=True
+        )
         return
-    await _send_chunked(ctx, _product_lines(rows, show_owner=False))
+    embeds = [_product_embed(row, show_owner=False) for row in rows]
+    await _send_embeds(interaction, embeds, ephemeral=True)
 
 
-@bot.command(name="list")
-async def list_all(ctx: commands.Context) -> None:
-    """List everything everyone is tracking."""
+@bot.tree.command(name="list", description="List everything everyone is tracking")
+async def list_all(interaction: discord.Interaction) -> None:
     rows = all_products()
     if not rows:
-        await ctx.send("Nothing is being tracked yet. Try `!addproduct <url>`.")
+        await interaction.response.send_message(
+            "Nothing is being tracked yet. Try `/addproduct`.", ephemeral=True
+        )
         return
-    await _send_chunked(ctx, _product_lines(rows, show_owner=True))
+    await _send_embeds(interaction, [_product_embed(row, show_owner=True) for row in rows])
 
 
-@bot.command()
-async def checknow(ctx: commands.Context) -> None:
-    """Manually trigger a check of all tracked products."""
+@bot.tree.command(description="Manually trigger a check of all tracked products")
+async def checknow(interaction: discord.Interaction) -> None:
     count = len(all_products())
     if count == 0:
-        await ctx.send("Nothing is being tracked yet. Try `!addproduct <url>`.")
+        await interaction.response.send_message(
+            "Nothing is being tracked yet. Try `/addproduct`.", ephemeral=True
+        )
         return
-    await ctx.send(f"Checking {count} product(s) now…")
+    await interaction.response.send_message(f"Checking {count} product(s) now…")
     newly_in_stock = await asyncio.to_thread(check_all_products_sync)
+    # A full check can outlive the interaction's 15-minute followup window,
+    # so report results directly to the channel instead.
+    channel = interaction.channel
     if newly_in_stock:
-        await announce([_alert_line(p) for p, _ in newly_in_stock], ctx)
+        await announce([_alert_line(p) for p, _ in newly_in_stock], channel)
     else:
-        await ctx.send("Done — no new stock changes.")
+        await channel.send("Done — no new stock changes.")
 
 
 def main() -> None:
